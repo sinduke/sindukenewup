@@ -1,0 +1,11 @@
+{
+  "name": "sindukenewup",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "check:deploy": "wrangler deploy --dry-run"
+  },
+  "devDependencies": {
+    "wrangler": "4.129.0"
+  }
+}
