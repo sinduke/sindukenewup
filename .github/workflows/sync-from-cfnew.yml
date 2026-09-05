@@ -5,6 +5,13 @@ on:
   schedule:
     - cron: '0 */6 * * *'  # 每6小时自动检查一次
 
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-from-cfnew-main
+  cancel-in-progress: false
+
 jobs:
   sync-release:
     runs-on: ubuntu-latest
@@ -13,45 +20,28 @@ jobs:
       - name: 检出仓库
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
+
+      - name: 验证同步保护逻辑
+        run: python3 -B .github/scripts/test_sync_release.py
       
       - name: 获取 cfnew 最新发布
         id: get_latest
         run: |
-          # 获取最新 release 信息
-          echo "正在获取最新发布信息..."
-          LATEST_RELEASE=$(curl -s https://api.github.com/repos/byJoey/cfnew/releases/latest)
-          
-          # 使用 sed 提取版本号（兼容性更好）
-          VERSION=$(echo "$LATEST_RELEASE" | sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p')
-          
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          LATEST_RELEASE=$(curl -fsSL --retry 3 https://api.github.com/repos/byJoey/cfnew/releases/latest)
+          VERSION=$(jq -er '.tag_name | select(type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._+-]*$"))' <<< "$LATEST_RELEASE")
+          DOWNLOAD_URL=$(jq -er '[.assets[] | select(.name == "Pages.zip") | .browser_download_url] | select(length == 1) | .[0] | select(startswith("https://github.com/byJoey/cfnew/releases/download/"))' <<< "$LATEST_RELEASE")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "download_url=$DOWNLOAD_URL" >> "$GITHUB_OUTPUT"
+          echo "file_name=Pages.zip" >> "$GITHUB_OUTPUT"
           echo "最新版本: $VERSION"
-          
-          # 获取所有 assets 文件
-          ASSETS_URL=$(echo "$LATEST_RELEASE" | sed -n 's/.*"assets_url": "\([^"]*\)".*/\1/p')
-          echo "正在获取文件列表..."
-          ASSETS=$(curl -s "$ASSETS_URL")
-          
-          # 查找 Pages.zip 文件
-          # 使用更可靠的方法查找包含 Pages.zip 的下载 URL
-          DOWNLOAD_URL=$(echo "$ASSETS" | grep -i "Pages\.zip" | grep -o '"browser_download_url": "[^"]*"' | sed 's/"browser_download_url": "\([^"]*\)"/\1/' | head -1)
-          FILE_NAME="Pages.zip"
-          
-          if [ -z "$DOWNLOAD_URL" ]; then
-            echo "错误：未找到 Pages.zip 文件"
-            echo "可用的文件列表："
-            echo "$ASSETS" | grep -o '"name": "[^"]*"' | sed 's/"name": "\([^"]*\)"/  - \1/'
-            exit 1
-          fi
-          
-          echo "download_url=$DOWNLOAD_URL" >> $GITHUB_OUTPUT
-          echo "file_name=$FILE_NAME" >> $GITHUB_OUTPUT
-          echo "下载 URL: $DOWNLOAD_URL"
-          echo "文件名: $FILE_NAME"
       
       - name: 检查当前版本
         id: check_version
+        env:
+          NEW_VERSION: ${{ steps.get_latest.outputs.version }}
         run: |
           # 读取当前记录的版本，如果文件不存在则创建空文件
           if [ ! -f "VERSION.txt" ]; then
@@ -67,7 +57,6 @@ jobs:
             fi
           fi
           
-          NEW_VERSION="${{ steps.get_latest.outputs.version }}"
           echo "latest_version=$NEW_VERSION" >> $GITHUB_OUTPUT
           echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
           
@@ -84,86 +73,65 @@ jobs:
             echo "need_update=false" >> $GITHUB_OUTPUT
           fi
       
+      - name: 设置 Node.js
+        if: steps.check_version.outputs.need_update == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: 安装锁定的构建依赖
+        if: steps.check_version.outputs.need_update == 'true'
+        run: npm ci
+
       - name: 下载并更新文件
         if: steps.check_version.outputs.need_update == 'true'
+        env:
+          DOWNLOAD_URL: ${{ steps.get_latest.outputs.download_url }}
+          VERSION: ${{ steps.get_latest.outputs.version }}
         run: |
-          DOWNLOAD_URL="${{ steps.get_latest.outputs.download_url }}"
-          FILE_NAME="${{ steps.get_latest.outputs.file_name }}"
-          VERSION="${{ steps.get_latest.outputs.version }}"
-          
-          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
-            echo "错误：未找到可下载的文件"
-            exit 1
-          fi
-          
-          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
-            echo "错误：未获取到版本号"
-            exit 1
-          fi
-          
-          echo "正在下载文件: $FILE_NAME"
-          curl -L -o "$FILE_NAME" "$DOWNLOAD_URL"
-          
-          if [ ! -f "$FILE_NAME" ]; then
-            echo "错误：下载失败"
-            exit 1
-          fi
-          
-          echo "下载成功: $FILE_NAME"
-          
-          # 解压缩 Pages.zip
-          echo "正在解压缩 $FILE_NAME..."
-          unzip -o "$FILE_NAME" -d .
-          
-          if [ $? -ne 0 ]; then
-            echo "错误：解压缩失败"
-            exit 1
-          fi
-          
-          echo "解压缩成功"
-          
-          # 删除 zip 文件（可选，如果不需要保留）
-          rm -f "$FILE_NAME"
-          echo "已删除压缩文件: $FILE_NAME"
-          
-          # 确保创建或更新版本记录文件
-          if [ ! -f "VERSION.txt" ]; then
-            echo "创建版本记录文件"
-            touch VERSION.txt
-          fi
-          
-          # 写入版本号
-          echo "$VERSION" > VERSION.txt
-          echo "版本记录已创建/更新: $VERSION"
-          
-          # 验证文件是否成功写入
-          if [ -f "VERSION.txt" ] && [ -s "VERSION.txt" ]; then
-            echo "✓ 版本记录文件创建成功"
-          else
-            echo "✗ 警告：版本记录文件可能未正确创建"
-          fi
-      
+          set -euo pipefail
+          SYNC_TMP=$(mktemp -d)
+          trap 'rm -rf "$SYNC_TMP"' EXIT
+          curl -fsSL --retry 3 -o "$SYNC_TMP/Pages.zip" "$DOWNLOAD_URL"
+          python3 .github/scripts/sync-release.py "$SYNC_TMP/Pages.zip" "$VERSION" "$RUNNER_TEMP/upstream-paths"
+
+      - name: 验证 Worker 打包
+        if: steps.check_version.outputs.need_update == 'true'
+        run: npm run check:deploy
+
       - name: 提交并推送更改
         if: steps.check_version.outputs.need_update == 'true'
+        env:
+          VERSION: ${{ steps.get_latest.outputs.version }}
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           
-          git add -A
+          git --literal-pathspecs add --pathspec-from-file="$RUNNER_TEMP/upstream-paths" --pathspec-file-nul
           
           if git diff --staged --quiet; then
             echo "没有变更需要提交"
           else
-            git commit -m "自动同步: 更新到 cfnew ${{ steps.get_latest.outputs.version }}"
+            git commit -m "自动同步: 更新到 cfnew $VERSION"
             git push
             echo "已提交并推送更新"
           fi
       
+      - name: 同步失败提示
+        if: failure()
+        run: |
+          echo '## 同步未完成' >> "$GITHUB_STEP_SUMMARY"
+          echo '请检查失败步骤：若有部署配置冲突或打包失败，应先检查上游兼容性，再重新运行。不要强制覆盖配置或强制推送。' >> "$GITHUB_STEP_SUMMARY"
+
       - name: 输出摘要
+        env:
+          LATEST_VERSION: ${{ steps.get_latest.outputs.version }}
+          CURRENT_VERSION: ${{ steps.check_version.outputs.current_version }}
         run: |
           echo "## 同步结果" >> $GITHUB_STEP_SUMMARY
-          echo "- 最新版本: ${{ steps.get_latest.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-          echo "- 当前版本: ${{ steps.check_version.outputs.current_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 最新版本: $LATEST_VERSION" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 当前版本: $CURRENT_VERSION" >> "$GITHUB_STEP_SUMMARY"
           
           if [ "${{ steps.check_version.outputs.need_update }}" = "true" ]; then
             echo "- 状态: ✅ 已更新到新版本" >> $GITHUB_STEP_SUMMARY
@@ -171,4 +139,3 @@ jobs:
           else
             echo "- 状态: ⏭️ 版本相同，无需更新" >> $GITHUB_STEP_SUMMARY
           fi
-
